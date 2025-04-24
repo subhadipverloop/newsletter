@@ -5,7 +5,17 @@ from pyspark.sql.functions import col,to_timestamp,month,count,\
                                     split,element_at,\
                                     avg,round
 import os, re, argparse
-from hurry.filesize import size
+import logging
+from datetime import datetime, timedelta
+import json
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 # ----------------------------------------------------------------------------------------
 #### Logging Pending
 
@@ -16,642 +26,460 @@ from hurry.filesize import size
 
 def intiate_spark_connection():
     spark = SparkSession.builder\
-        .appName('Starting Pyspark Application for Verloop Monthly Newsletter :)')\
+        .appName('Verloop Monthly Newsletter Analytics')\
+        .config("spark.sql.shuffle.partitions", "200") \
+        .config("spark.default.parallelism", "200") \
+        .config("spark.sql.adaptive.enabled", "true") \
+        .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
+        .config("spark.sql.adaptive.skewJoin.enabled", "true") \
+        .config("spark.sql.adaptive.localShuffleReader.enabled", "true") \
+        .config("spark.sql.adaptive.nonEmptyPartitionRatioForBroadcastJoin", "0.2") \
+        .config("spark.sql.autoBroadcastJoinThreshold", "-1") \
+        .config("spark.sql.files.maxPartitionBytes", "128MB") \
+        .config("spark.sql.files.openCostInBytes", "4194304") \
+        .config("spark.sql.broadcastTimeout", "300") \
+        .config("spark.sql.parquet.compression.codec", "snappy") \
+        .config("spark.executor.memory", "4g") \
+        .config("spark.driver.memory", "4g") \
+        .config("spark.memory.fraction", "0.8") \
+        .config("spark.memory.storageFraction", "0.5") \
         .getOrCreate()
+    
+    logger.info("Spark session initialized with optimized configuration")
     return spark
 
 # ----------------------------------------------------------------------------------------
 # Export incoming data lamda function - PENDING
+# modified
 
-def export_data(final_df):
-    print(final_df.show())
-
-# ----------------------------------------------------------------------------------------
-# Pending - Only for local
-def file_list(base_path):
-    files = []
-    for each in os.listdir(base_path):
-        files.append(f'{base_path}\\{each}')
-    for f in files:
-        print(f'File Size - {size(os.path.getsize(f))} | File to be processed - {f}')
-    return files
-
+def export_data(final_df, output_path=None,export_path=None,last_month=-1,clientid='default'):
+    # Change here - Add client ID to separte outpur bucket if needed
+    if output_path and export_path:
+        logger.info(f"Writing data to {output_path}")
+        final_df.write.mode("overwrite")\
+            .option("compression", "snappy")\
+            .parquet(f'{export_path}{clientid}/{last_month}/{output_path}')
+    else:
+        logger.info("Displaying sample data")
+        final_df.show(10, truncate=False)
+    # print(final_df.show())
+    # Clear the dataframe from memory after export
+    final_df.unpersist()
 # ----------------------------------------------------------------------------------------
 # Read all files from the path
 
 def read_files(spark,file_list):
+    logger.info(f"Reading files: {file_list}")
     main_df = spark.read\
-        .option("header",True)\
+        .option("header", True)\
         .option('multiline', True)\
+        .option("inferSchema", True)\
+        .option("timestampFormat", "dd-MM-yyyy HH:mm:ss")\
         .csv(file_list)
+    
+    # Cache the main dataframe as it's used across multiple operations
+    main_df.cache()
+    logger.info(f"Data loaded and cached. Total rows: {main_df.count()}")
     return main_df
 
 # ----------------------------------------------------------------------------------------
 # Change here - Chat_Metrics - Last 6 Months
 
-def chat_metrics(main_df):
-    df = main_df.filter(
-            (main_df.RoomStatus=='RESOLVED')
-        ).select(
-            main_df.RoomCode,
-            to_timestamp(main_df.ChatEndTime,format='dd-MM-yyyy HH:mm:ss').alias('ChatEndTime'),
-            main_df.UserId,
-            main_df.ClosedBy
-        )
-    # ---------------------
-    # ---------------------
-    # ---------------------
-    d0 = df.groupBy(
-        month(df.ChatEndTime).alias("month")
-        ).agg(
-            count(df.RoomCode).alias("incoming_chats"),
-            count_distinct(df.UserId).alias('unique_users')
-        )
-
-    d1 = df.groupBy(
-            month(df.ChatEndTime).alias('month_'),
-            df.UserId.alias('user_id')
-        ).agg(
-            count(df.RoomCode).alias('incoming_chats'),
-        ).filter(
-            col("incoming_chats")>1
-        ).groupBy(
-            col('month_')
-        ).agg(
-            count(col('user_id')).alias('recurring_users')
-        )
-    d0= d0.join(d1,d0.month == d1.month_,"inner")
-    chat_metrics_1 = d0.select(d0.month,d0.incoming_chats,d0.unique_users,d0.recurring_users)
-    # chat_metrics_1.show(10)
-    export_data(chat_metrics_1)
-    # ---------------------
-    # ---------------------
-    # ---------------------
-    chat_metrics_2 = df.groupBy(
-            month(df.ChatEndTime).alias("month")
-        ).agg(
-            count(col('RoomCode')).alias('total_room_count'),
-            count(
-                when(
-                    (col('ClosedBy') == 'System'),
-                    df.RoomCode
-                )
-            ).alias('closed_by_bot'),
-            count(
-                when(
-                    (col('ClosedBy') != 'System'),
-                    df.RoomCode  
-                )
-            ).alias('closed_by_agent')
-        )
-    # chat_metrics_2.show(10)
-    export_data(chat_metrics_2)
-    # ---------------------
-    # ---------------------
-    # ---------------------
-    # Export pending
+def chat_metrics(main_df,clientid,export_path,last_month):
+    logger.info("Processing chat metrics")
+    
+    # Create base dataframe with only required columns
+    base_df = main_df.filter(
+        (main_df.RoomStatus == 'RESOLVED')
+    ).select(
+        main_df.RoomCode,
+        to_timestamp(main_df.ChatEndTime, format='dd-MM-yyyy HH:mm:ss').alias('ChatEndTime'),
+        main_df.UserId,
+        main_df.ClosedBy
+    ).cache()
+    
+    # Calculate all metrics in a single pass
+    metrics = base_df.groupBy(
+        month(col('ChatEndTime')).alias("month")
+    ).agg(
+        count(col('RoomCode')).alias("incoming_chats"),
+        count_distinct(col('UserId')).alias('unique_users'),
+        count(when(col('ClosedBy') == 'System', col('RoomCode'))).alias('closed_by_bot'),
+        count(when(col('ClosedBy') != 'System', col('RoomCode'))).alias('closed_by_agent')
+    )
+    
+    # Calculate recurring users
+    recurring_users = base_df.groupBy(
+        month(col('ChatEndTime')).alias('month'),
+        col('UserId')
+    ).agg(
+        count(col('RoomCode')).alias('chat_count')
+    ).filter(
+        col('chat_count') > 1
+    ).groupBy(
+        col('month')
+    ).agg(
+        count(col('UserId')).alias('recurring_users')
+    )
+    
+    # Join metrics and export
+    final_metrics = metrics.join(
+        recurring_users,
+        metrics.month == recurring_users.month,
+        "left"
+    ).select(
+        metrics.month,
+        metrics.incoming_chats,
+        metrics.unique_users,
+        recurring_users.recurring_users,
+        metrics.closed_by_bot,
+        metrics.closed_by_agent
+    )
+    
+    export_data(final_metrics, "output/chat_metrics",export_path,last_month,clientid)
+    base_df.unpersist()
 
 # ----------------------------------------------------------------------------------------
 # Change here - Channels/Channel Metric/Peak Hour Hourly Volume - Last 1 Month 
 
-def channels(main_df, last_month):
-    df = main_df.select(
+def channels(main_df,clientid,export_path,last_month):
+    logger.info(f"Processing channel metrics for month {last_month}")
+    
+    base_df = main_df.select(
         main_df.RoomCode,
-        to_timestamp(main_df.ChatEndTime,format='dd-MM-yyyy HH:mm:ss').alias('ChatEndTime'),
+        to_timestamp(main_df.ChatEndTime, format='dd-MM-yyyy HH:mm:ss').alias('ChatEndTime'),
         main_df.UserOs,
         main_df.ChatChannel,
-        ).filter(
-            (main_df.RoomStatus=='RESOLVED') & 
-            (month(col('ChatEndTime')) == last_month)
-        )
-    # ---------------------
-    # ---------------------
-    # ---------------------
-    channels_1 = df.groupBy(
-            hour(df.ChatEndTime).alias('hour')
-        ).agg(
-            count(df.RoomCode).alias('total_chats'),
-            count(when(
-                col('ChatChannel')=='LIVECHAT',df.RoomCode
-            )).alias('channel_livechat'),
-            count(when(
-                col('ChatChannel') == 'WHATSAPP',df.RoomCode
-            )).alias('channel_whatsapp'),
-            count(when(
-                ~(
-                    (col('ChatChannel') == 'LIVECHAT') |
-                    (col('ChatChannel') == 'WHATSAPP')
-                ),df.RoomCode
-            )).alias('channel_other'),
-            count(when(
-                col('UserOs').rlike('^Android*'),df.RoomCode
-            )).alias('device_android'),
-            count(when(
-                col('UserOs').rlike('^iOS*'),df.RoomCode
-            )).alias('device_ios'),
-            count(when(
-                col('UserOs').rlike('^macOS*'),df.RoomCode
-            )).alias('device_macos'),
-            count(when(
-                col('UserOs').rlike('^Windows*'),df.RoomCode
-            )).alias('device_windows'),
-            count(when(
-                ~(
-                    col('UserOs').rlike('^Android*') |
-                    col('UserOs').rlike('^iOS*') |
-                    col('UserOs').rlike('^macOS*') |
-                    col('UserOs').rlike('^Windows*')
-                ),df.RoomCode
-            )).alias('device_other'),
-        )
-    # channels_1.show(10)
-    export_data(channels_1)
-    # ---------------------
-    # ---------------------
-    # ---------------------
-    # Export Pending
+    ).filter(
+        (main_df.RoomStatus == 'RESOLVED') & 
+        (month(col('ChatEndTime')) == last_month)
+    ).cache()
+    
+    # Calculate all metrics in a single pass
+    channel_metrics = base_df.groupBy(
+        hour(col('ChatEndTime')).alias('hour')
+    ).agg(
+        count(col('RoomCode')).alias('total_chats'),
+        count(when(col('ChatChannel') == 'LIVECHAT', col('RoomCode'))).alias('channel_livechat'),
+        count(when(col('ChatChannel') == 'WHATSAPP', col('RoomCode'))).alias('channel_whatsapp'),
+        count(when(~((col('ChatChannel') == 'LIVECHAT') | (col('ChatChannel') == 'WHATSAPP')), col('RoomCode'))).alias('channel_other'),
+        count(when(col('UserOs').rlike('^Android*'), col('RoomCode'))).alias('device_android'),
+        count(when(col('UserOs').rlike('^iOS*'), col('RoomCode'))).alias('device_ios'),
+        count(when(col('UserOs').rlike('^macOS*'), col('RoomCode'))).alias('device_macos'),
+        count(when(col('UserOs').rlike('^Windows*'), col('RoomCode'))).alias('device_windows'),
+        count(when(~(
+            col('UserOs').rlike('^Android*') |
+            col('UserOs').rlike('^iOS*') |
+            col('UserOs').rlike('^macOS*') |
+            col('UserOs').rlike('^Windows*')
+        ), col('RoomCode'))).alias('device_other')
+    )
+    
+    export_data(channel_metrics, "output/channel_metrics",export_path,last_month,clientid)
+    base_df.unpersist()
 
 # ----------------------------------------------------------------------------------------
-# Change here - Peak Hour - Last 1 Month
-# For hourly chat count refer to channels data - defined above
-
-def peak_hour(main_df,last_month):
-    df = main_df.select(
+# Optimized peak hour analysis
+def peak_hour(main_df,clientid,export_path,last_month):
+    logger.info(f"Processing peak hour metrics for month {last_month}")
+    
+    base_df = main_df.select(
         main_df.RoomCode,
-        to_timestamp(main_df.ChatEndTime,format='dd-MM-yyyy HH:mm:ss').alias('ChatEndTime'),
-        ).filter(
-            (main_df.RoomStatus=='RESOLVED') & 
-            (month(col('ChatEndTime')) == last_month)
-        )
-    # ---------------------
-    # ---------------------
-    # ---------------------
-    # weekday [0-6] = [Monday-Sunday]
-    peak_hour_2 = df.groupBy(
-            weekday(df.ChatEndTime).alias('weekday')
-        ).agg(
-            count(df.RoomCode).alias('total_chats')
-        )
-    # peak_hour_2.show(10)
-    export_data(peak_hour_2)
-    # ---------------------
-    # ---------------------
-    # ---------------------
-    # Export Pending
+        to_timestamp(main_df.ChatEndTime, format='dd-MM-yyyy HH:mm:ss').alias('ChatEndTime'),
+    ).filter(
+        (main_df.RoomStatus == 'RESOLVED') & 
+        (month(col('ChatEndTime')) == last_month)
+    ).cache()
+    
+    # Calculate hourly and weekday metrics in a single pass
+    hourly_metrics = base_df.groupBy(
+        hour(col('ChatEndTime')).alias('hour')
+    ).agg(
+        count(col('RoomCode')).alias('total_chats')
+    )
+    
+    weekday_metrics = base_df.groupBy(
+        weekday(col('ChatEndTime')).alias('weekday')
+    ).agg(
+        count(col('RoomCode')).alias('total_chats')
+    )
+    
+    export_data(hourly_metrics, "output/hourly_metrics",export_path,last_month,clientid)
+    export_data(weekday_metrics, "output/weekday_metrics",export_path,last_month,clientid)
+    base_df.unpersist()
 
 # ----------------------------------------------------------------------------------------
 # Change here - CSAT Metrics - Last 6 Months
-
-def csat_metrics(main_df):
-    df = main_df.select(
+# modified
+def csat_metrics(main_df,clientid,export_path,last_month):
+    logger.info("Processing CSAT metrics")
+    
+    base_df = main_df.select(
         main_df.RoomCode,
-        to_timestamp(main_df.CsatSubmittedAt,format='dd-MM-yyyy HH:mm:ss').alias('csat_submittedat'),
-        to_timestamp(main_df.CsatTriggeredAt,format='dd-MM-yyyy HH:mm:ss').alias('csat_triggeredat'),
+        to_timestamp(main_df.CsatSubmittedAt, format='dd-MM-yyyy HH:mm:ss').alias('csat_submittedat'),
+        to_timestamp(main_df.CsatTriggeredAt, format='dd-MM-yyyy HH:mm:ss').alias('csat_triggeredat'),
         main_df.UserId,
-        main_df.ClosedBy
-    ).filter(col('csat_triggeredat').isNotNull())
-    # ---------------------
-    # ---------------------
-    # ---------------------
-    d0 = df.groupBy(
+        main_df.ClosedBy,
+        main_df.CsatScore
+    ).filter(
+        col('csat_triggeredat').isNotNull()
+    ).cache()
+    
+    # Calculate all CSAT metrics in a single pass
+    csat_metrics = base_df.groupBy(
         month(col('csat_triggeredat')).alias('month')
-        ).agg(
-            count(col('csat_triggeredat')).alias('total_triggered_csat'),
-            count(
-                when(
-                    col('csat_submittedat').isNotNull(),
-                    col('csat_submittedat')
-                )
-            ).alias('total_submitted_csat'),
-            count_distinct(
-                when(
-                    col('csat_submittedat').isNotNull(),
-                    col('UserId')
-                )
-            ).alias('unique_user_submitted_csat'),
-            count(
-                when(
-                    (
-                        col('csat_submittedat').isNotNull() &
-                        (col('ClosedBy') == 'System')
-                    ),
-                    col('csat_submittedat')
-                )
-            ).alias('bot_submitted_csat'),
-            count(
-                when(
-                    (
-                        col('csat_submittedat').isNotNull() &
-                        (col('ClosedBy') != 'System')
-                    ),
-                    col('csat_submittedat')
-                )
-            ).alias('agent_submitted_csat'),
-
-        )
-    d1 = df.filter(
-            col('csat_submittedat').isNotNull() 
-        ).groupBy(
-            month(col('csat_triggeredat')).alias('month_'),
-            col('UserId')
-        ).agg(
-            count(
-                col('csat_submittedat')
-            ).alias('recurring_user_submitted_csat_'),
-        ).filter(
-            col('recurring_user_submitted_csat_')>1
-        ).groupBy(
-            col('month_').alias('month')
-        ).agg(
-            count(
-                col('recurring_user_submitted_csat_')
-            ).alias('recurring_user_submitted_csat')
-        )
-    csat_metrics_1 = d0.join(d1,d0.month == d1.month,'inner').select(
-            d0.month,
-            col('total_triggered_csat'),
-            col('total_submitted_csat'),
-            col('unique_user_submitted_csat'),
-            col('recurring_user_submitted_csat'),
-            col('bot_submitted_csat'),
-            col('agent_submitted_csat')
-        )
-    # csat_metrics_1.show(10)
-    export_data(csat_metrics_1)
-    # ---------------------
-    # ---------------------
-    # ---------------------
-    # Export Pending
+    ).agg(
+        count(col('csat_triggeredat')).alias('total_triggered_csat'),
+        count(when(col('csat_submittedat').isNotNull(), col('csat_submittedat'))).alias('total_submitted_csat'),
+        count_distinct(when(col('csat_submittedat').isNotNull(), col('UserId'))).alias('unique_user_submitted_csat'),
+        count(when((col('csat_submittedat').isNotNull() & (col('ClosedBy') == 'System')), col('csat_submittedat'))).alias('bot_submitted_csat'),
+        count(when((col('csat_submittedat').isNotNull() & (col('ClosedBy') != 'System')), col('csat_submittedat'))).alias('agent_submitted_csat'),
+        round(avg(when(col('csat_submittedat').isNotNull(), col('CsatScore'))), 2).alias('avg_csat_score')
+    )
+    
+    # Calculate recurring user submissions
+    recurring_users = base_df.filter(
+        col('csat_submittedat').isNotNull()
+    ).groupBy(
+        month(col('csat_triggeredat')).alias('month_'),
+        col('UserId')
+    ).agg(
+        count(col('csat_submittedat')).alias('submission_count')
+    ).filter(
+        col('submission_count') > 1
+    ).groupBy(
+        col('month_')
+    ).agg(
+        count(col('UserId')).alias('recurring_user_submitted_csat')
+    )
+    
+    # Join and export final metrics
+    final_metrics = csat_metrics.join(
+        recurring_users,
+        csat_metrics.month == recurring_users.month_,
+        "left"
+    )
+    
+    export_data(final_metrics, "output/csat_metrics",export_path,last_month,clientid)
+    base_df.unpersist()
 
 # ----------------------------------------------------------------------------------------
 # Change here - Menu_Metrics - Last 6 Months
 
-def menu_metrics(main_df):
-    #### Change here - To change/add main menu block
-    main_manu = ['mainmenu', 'main_menu','main-menu']
-    ####
-    main_menu_block = None
-    for each in main_df.columns:
-        if each.lower() in main_manu:
-            main_menu_block = each
+def menu_metrics(main_df,clientid,export_path,last_month):
+    logger.info("Processing menu metrics")
+    
+    # Find main menu column
+    main_menu_columns = ['mainmenu', 'main_menu', 'main-menu']
+    main_menu_col = None
+    for col_name in main_df.columns:
+        if col_name.lower() in main_menu_columns:
+            main_menu_col = col_name
             break
-    # ---------------------
-    # ---------------------
-    # ---------------------
-    if main_menu_block:
-        df = main_df.filter(
-            (main_df.RoomStatus=='RESOLVED')
+    
+    if main_menu_col:
+        base_df = main_df.filter(
+            (main_df.RoomStatus == 'RESOLVED') &
+            (col(main_menu_col).isNotNull())
         ).select(
             main_df.RoomCode,
-            to_timestamp(main_df.ChatEndTime,format='dd-MM-yyyy HH:mm:ss').alias('ChatEndTime'),
-            col(main_menu_block).alias('main_menu'),
+            to_timestamp(main_df.ChatEndTime, format='dd-MM-yyyy HH:mm:ss').alias('ChatEndTime'),
+            col(main_menu_col).alias('main_menu')
+        ).cache()
+        
+        menu_metrics = base_df.groupBy(
+            month(col('ChatEndTime')).alias('month'),
+            col('main_menu')
+        ).agg(
+            count(col('RoomCode')).alias('main_menu_chat_counts')
         )
-
-        main_menu_metrics = df.filter(
-                col('main_menu').isNotNull()
-            ).groupBy(
-                month(col('ChatEndTime')).alias('month'),
-                col('main_menu')
-            ).agg(
-                count(col('RoomCode')).alias('main_menu_chat_counts')
-            )
-        # main_menu_metrics.show(10)
-        export_data(main_menu_metrics)
-    # ---------------------
-    # ---------------------
-    # ---------------------
-    # Export Pending
+        
+        export_data(menu_metrics, "output/menu_metrics",export_path,last_month,clientid)
+        base_df.unpersist()
 
 # ----------------------------------------------------------------------------------------
-# Change here - Drops - Last 1 Month
-
-def drops(main_df,last_month):
-    df = main_df.select(
+# Optimized drops analysis
+def drops(main_df,clientid,export_path,last_month):
+    logger.info(f"Processing drops metrics for month {last_month}")
+    
+    base_df = main_df.select(
         main_df.RoomCode,
         main_df.RecipeFlow,
-        to_timestamp(main_df.ChatEndTime,format='dd-MM-yyyy HH:mm:ss').alias('ChatEndTime'),
-        ).filter(
-            (main_df.ClosedBy=='System') & 
-            (month(col('ChatEndTime')) == last_month)
-        )
-    # ---------------------
-    # ---------------------
-    # ---------------------
-    drops = df.groupBy(
-            element_at(
-                split(
-                    col('RecipeFlow'),
-                    '->'
-                ),
-                -1
-            ).alias('drops_at')
-        ).agg(
-            count(col('RoomCode')).alias('total_chats')
-        )
-    # drops.show(10)
-    export_data(drops)
-    # ---------------------
-    # ---------------------
-    # ---------------------
-    # Export Pending
+        to_timestamp(main_df.ChatEndTime, format='dd-MM-yyyy HH:mm:ss').alias('ChatEndTime'),
+    ).filter(
+        (main_df.ClosedBy == 'System') & 
+        (month(col('ChatEndTime')) == last_month)
+    ).cache()
+    
+    drops_metrics = base_df.groupBy(
+        element_at(split(col('RecipeFlow'), '->'), -1).alias('drops_at')
+    ).agg(
+        count(col('RoomCode')).alias('total_chats')
+    )
+    
+    export_data(drops_metrics, "output/drops_metrics",export_path,last_month,clientid)
+    base_df.unpersist()
 
 # ----------------------------------------------------------------------------------------
 # Change here - Agent Metrics - Last 6 Months
 
-def agent_metrics(main_df):
-    df = main_df.filter(
-            (main_df.RoomStatus == 'RESOLVED') & 
-            (~((main_df.ClosedBy == 'System') | (main_df.ClosedBy == 'Dina')))
-        ).select(
-            to_timestamp(main_df.ChatEndTime,format='dd-MM-yyyy HH:mm:ss').alias('ChatEndTime'),
-            main_df.FirstAgentFirstResponseTime,
-            main_df.TotalAgentResponseTime,
-            main_df.AverageAgentResponseTime,
-            col('RoomCode')
-        )
-    # ---------------------
-    # ---------------------
-    # ---------------------
-    # Convrting String duration in Seconds (Example: 00:05:31 = 331)
-    # values are in seconds
-    df = df.withColumn(
+def agent_metrics(main_df,clientid,export_path,last_month):
+    logger.info("Processing agent metrics")
+    
+    base_df = main_df.filter(
+        (main_df.RoomStatus == 'RESOLVED') & 
+        (~((main_df.ClosedBy == 'System') | (main_df.ClosedBy == 'Dina')))
+    ).select(
+        to_timestamp(main_df.ChatEndTime, format='dd-MM-yyyy HH:mm:ss').alias('ChatEndTime'),
+        main_df.FirstAgentFirstResponseTime,
+        main_df.TotalAgentResponseTime,
+        main_df.AverageAgentResponseTime,
+        col('RoomCode')
+    ).cache()
+    
+    # Convert time strings to seconds in a single pass
+    time_metrics = base_df.withColumn(
         'FirstAgentFirstResponseTime_sec',
         (
-            (
-                element_at(
-                    split(
-                        col('FirstAgentFirstResponseTime'),
-                        ':'
-                    ),
-                    1
-                ).cast('int')  * 3600
-            ) +
-            (
-                element_at(
-                    split(
-                        col('FirstAgentFirstResponseTime'),
-                        ':'
-                    ),
-                    2
-                ).cast('int')  * 60 
-            )+
-            (
-                element_at(
-                    split(
-                        col('FirstAgentFirstResponseTime'),
-                        ':'
-                    ),
-                    3
-                ).cast('int') 
-            )
+            element_at(split(col('FirstAgentFirstResponseTime'), ':'), 1).cast('int') * 3600 +
+            element_at(split(col('FirstAgentFirstResponseTime'), ':'), 2).cast('int') * 60 +
+            element_at(split(col('FirstAgentFirstResponseTime'), ':'), 3).cast('int')
         )
-        ).withColumn(
+    ).withColumn(
         'TotalAgentResponseTime_sec',
         (
-            (
-                element_at(
-                    split(
-                        col('TotalAgentResponseTime'),
-                        ':'
-                    ),
-                    1
-                ).cast('int')  * 3600
-            ) +
-            (
-                element_at(
-                    split(
-                        col('TotalAgentResponseTime'),
-                        ':'
-                    ),
-                    2
-                ).cast('int')  * 60 
-            )+
-            (
-                element_at(
-                    split(
-                        col('TotalAgentResponseTime'),
-                        ':'
-                    ),
-                    3
-                ).cast('int') 
-            )
-        ) 
-        ).withColumn(
+            element_at(split(col('TotalAgentResponseTime'), ':'), 1).cast('int') * 3600 +
+            element_at(split(col('TotalAgentResponseTime'), ':'), 2).cast('int') * 60 +
+            element_at(split(col('TotalAgentResponseTime'), ':'), 3).cast('int')
+        )
+    ).withColumn(
         'AverageAgentResponseTime_sec',
         (
-            (
-                element_at(
-                    split(
-                        col('AverageAgentResponseTime'),
-                        ':'
-                    ),
-                    1
-                ).cast('int')  * 3600
-            ) +
-            (
-                element_at(
-                    split(
-                        col('AverageAgentResponseTime'),
-                        ':'
-                    ),
-                    2
-                ).cast('int')  * 60 
-            )+
-            (
-                element_at(
-                    split(
-                        col('AverageAgentResponseTime'),
-                        ':'
-                    ),
-                    3
-                ).cast('int') 
-            )
-        )     
+            element_at(split(col('AverageAgentResponseTime'), ':'), 1).cast('int') * 3600 +
+            element_at(split(col('AverageAgentResponseTime'), ':'), 2).cast('int') * 60 +
+            element_at(split(col('AverageAgentResponseTime'), ':'), 3).cast('int')
         )
-    agent_metrics = df.groupBy(
+    )
+    
+    agent_metrics = time_metrics.groupBy(
         month(col('ChatEndTime')).alias('month')
-        ).agg(
-            round(avg(col('FirstAgentFirstResponseTime_sec')),1).alias('avg_FirstAgentFirstResponseTime_sec'),
-            round(avg(col('TotalAgentResponseTime_sec')),1).alias('avg_TotalAgentResponseTime_sec'),
-            round(avg(col('AverageAgentResponseTime_sec')),1).alias('AverageAgentResponseTime_sec')
-        )
-    # agent_metrics.show(10)
-    export_data(agent_metrics)
-    # ---------------------
-    # ---------------------
-    # ---------------------
-    # Export Pending
+    ).agg(
+        round(avg(col('FirstAgentFirstResponseTime_sec')), 1).alias('avg_FirstAgentFirstResponseTime_sec'),
+        round(avg(col('TotalAgentResponseTime_sec')), 1).alias('avg_TotalAgentResponseTime_sec'),
+        round(avg(col('AverageAgentResponseTime_sec')), 1).alias('AverageAgentResponseTime_sec')
+    )
+    
+    export_data(agent_metrics, "output/agent_metrics",export_path,last_month,clientid)
+    base_df.unpersist()
 
 # ----------------------------------------------------------------------------------------
 # Change here - Recipe - Last 6 Months
 
-def recipe(main_df):
-    df = main_df.filter(
-            (main_df.RoomStatus == 'RESOLVED')
-        ).select(
-            main_df.RoomCode,
-            main_df.RecipeId,
-            main_df.RecipeName,
-            to_timestamp(main_df.ChatEndTime,format='dd-MM-yyyy HH:mm:ss').alias('ChatEndTime')
-        )
-    # ---------------------
-    # ---------------------
-    # ---------------------
-    recipe = df.groupBy(
-            month(col('ChatEndTime')).alias('month'),
-            df.RecipeName
-        ).agg(
-            count(df.RoomCode).alias('total_chats')
-        )
-    # recipe.show(10)
-    export_data(recipe)
-    # ---------------------
-    # ---------------------
-    # ---------------------
-    # Export Pending
+def recipe(main_df,clientid,export_path,last_month):
+    logger.info("Processing recipe metrics")
+    
+    base_df = main_df.filter(
+        (main_df.RoomStatus == 'RESOLVED')
+    ).select(
+        main_df.RoomCode,
+        main_df.RecipeId,
+        main_df.RecipeName,
+        to_timestamp(main_df.ChatEndTime, format='dd-MM-yyyy HH:mm:ss').alias('ChatEndTime')
+    ).cache()
+    
+    recipe_metrics = base_df.groupBy(
+        month(col('ChatEndTime')).alias('month'),
+        col('RecipeName')
+    ).agg(
+        count(col('RoomCode')).alias('total_chats')
+    )
+    
+    export_data(recipe_metrics, "output/recipe_metrics",export_path,last_month,clientid)
+    base_df.unpersist()
 
 # ----------------------------------------------------------------------------------------
 # Change here - Bot Closure - Last 1 Month
 
-def bot_closure(main_df,last_month):
-    df = main_df.filter((main_df.RoomStatus == 'RESOLVED')).select(
-            main_df.RoomCode,
-            main_df.ClosingComment,
-            to_timestamp(main_df.ChatEndTime,format='dd-MM-yyyy HH:mm:ss').alias('ChatEndTime')
-        ).filter(
-            (main_df.ClosedBy=='System') & 
-            (month(col('ChatEndTime')) == last_month)
-        )
-    # ---------------------
-    # ---------------------
-    # ---------------------
-    bot_closure = df.groupBy(
-            col('ClosingComment').alias('closing_comment')
-        ).agg(
-            count(col('RoomCode').alias('total_chats'))
-        )
-    # bot_closure.show(10)
-    export_data(bot_closure)
-    # ---------------------
-    # ---------------------
-    # ---------------------
-    # Export Pending
-
-# ----------------------------------------------------------------------------------------
-# Change here - CSAT - Last 6 Months
-
-def csat(main_df):
-    df = main_df.select(
-        main_df.RoomCode,
-        to_timestamp(main_df.CsatSubmittedAt,format='dd-MM-yyyy HH:mm:ss').alias('csat_submittedat'),
-        to_timestamp(main_df.CsatTriggeredAt,format='dd-MM-yyyy HH:mm:ss').alias('csat_triggeredat'),
-        main_df.CsatScore
-    ).filter(col('csat_triggeredat').isNotNull())
-    # ---------------------
-    # ---------------------
-    # ---------------------
-    csat1 = df.groupBy(
-            month(col('csat_triggeredat')).alias('month')
-        ).agg(
-            round(
-                avg(
-                    when(
-                        col('csat_submittedat').isNotNull(),
-                        col('CsatScore')
-                    )
-                )*20,
-                2
-            ).alias('normalized_csat'),
-            count(
-                when(
-                    col('csat_submittedat').isNotNull(),
-                    col('csat_submittedat')
-                    )
-                ).alias('total_csat_submitted'),
-            count(
-                col('csat_triggeredat')
-                ).alias('total_csat_triggered')
-        )
-    # csat.show(10)
-    export_data(csat1)
-    # ---------------------
-    # ---------------------
-    # ---------------------
-    # Export Pending
-
-# ----------------------------------------------------------------------------------------
-# Change here - CSAT 2 - Last 6 Months
-
-def csat_2(main_df):
-    df = main_df.select(
-        main_df.RoomCode,
-        to_timestamp(main_df.CsatSubmittedAt,format='dd-MM-yyyy HH:mm:ss').alias('csat_submittedat'),
-        main_df.CsatScore,
-        main_df.ClosedBy
-    ).filter(col('csat_submittedat').isNotNull())
-    # ---------------------
-    # ---------------------
-    # ---------------------
-    csat2 = df.groupBy(
-            month(col('csat_submittedat')).alias('month')
-        ).agg(
-            round(
-                avg(
-                    when(
-                        col('ClosedBy')=='System',
-                        col('CsatScore')
-                    )
-                )*20,
-                2
-            ).alias('normalized_bot_csat'),
-            round(
-                avg(
-                    when(
-                        col('ClosedBy')!='System',
-                        col('CsatScore')
-                    )
-                )*20,
-                2
-            ).alias('normalized_agent_csat'),
-        )
-    # csat2.show(10)
-    export_data(csat2)
-    # ---------------------
-    # ---------------------
-    # ---------------------
-    # Export Pending
-
-# ----------------------------------------------------------------------------------------
-
-# Pending task - Create unified function to collect and send final result 
-# from each function to serverless function to update g sheet
-#
-
-def newsletter_entry():
-    ## change as per requirement
-    ## Pending collect this as cli argument
-    clientid = ''
-    base_storage_path = ''
-    base_path = 'M:\\verloop\\DA\\adib'
-    last_month = 3
-    spark = intiate_spark_connection()
-    main_df = read_files(
-            spark=spark,
-            file_list=file_list(base_path=base_path)
-        )
-    chat_metrics(main_df=main_df)
-    channels(main_df=main_df,last_month=last_month)
-    peak_hour(main_df=main_df,last_month=last_month)
-    csat_metrics(main_df=main_df)
-    menu_metrics(main_df=main_df)
-    drops(main_df=main_df,last_month=last_month)
-    agent_metrics(main_df=main_df)
-    recipe(main_df=main_df)
-    bot_closure(main_df=main_df,last_month=last_month)
-    csat(main_df=main_df)
-    csat_2(main_df=main_df)
-newsletter_entry()
+def bot_closure(main_df,clientid,export_path,last_month):
+    logger.info(f"Processing bot closure metrics for month {last_month}")
     
+    base_df = main_df.filter(
+        (main_df.RoomStatus == 'RESOLVED') &
+        (main_df.ClosedBy == 'System') &
+        (month(to_timestamp(main_df.ChatEndTime, format='dd-MM-yyyy HH:mm:ss')) == last_month)
+    ).select(
+        main_df.RoomCode,
+        main_df.ClosingComment
+    ).cache()
+    
+    closure_metrics = base_df.groupBy(
+        col('ClosingComment').alias('closing_comment')
+    ).agg(
+        count(col('RoomCode')).alias('total_chats')
+    )
+    
+    export_data(closure_metrics, "output/bot_closure_metrics",export_path,last_month,clientid)
+    base_df.unpersist()
 
+# ----------------------------------------------------------------------------------------
+# Optimized main entry point
+def newsletter_entry():
+    parser = argparse.ArgumentParser(description='Generate Verloop Monthly Newsletter Analytics')
+    # clientid = whatsapptesting.mena/express
+    parser.add_argument('--clientid', required=True, help='Client ID')
+    # base-path where csv files are present [s3://verloop-reports-cloudxero/files/]
+    # after files/ all csv files are present
+    parser.add_argument('--base-path', required=True, help='Base path for input files') 
+    # export path where csv files will be saved [s3://verloop-reports-cloudxero/files/]
+    # Note: Parquet file will be saved like - s3://verloop-reports-cloudxero/files/output/<last_month>/<mertics name>/<something.parquet>
+    # s3://verloop-reports-cloudxero/files/output/3/agent_metrics/part-00000-d3d5d0b8-70ef-4a00-a0b4-f211eb727425-c000.snappy.parquet
+    parser.add_argument('--export-path', required=True, help='Base path for input files') 
+    # Last month number [3,5,12,1 like this]
+    parser.add_argument('--last-month', type=int, help='Last month to analyze (1-12)')
+    args = parser.parse_args()
+    
+    # Set default last month to previous month if not specified
+    if not args.last_month:
+        last_month = (datetime.now() - timedelta(days=30)).month
+    else:
+        last_month = args.last_month
+    
+    logger.info(f"Starting analytics for client {args.clientid}")
+    logger.info(f"Processing data from {args.base_path}")
+    logger.info(f"Analyzing month: {last_month}")
+    
+    spark = intiate_spark_connection()
+    clientid = args.clientid
+    base_path = args.base_path
+    export_path = args.export_path
+    last_month = args.last_month
+
+    try:
+        # main_df = read_files(spark, file_list(args.base_path))
+        main_df = read_files(spark, args.base_path)
+        
+        # Process all metrics
+        chat_metrics(main_df,clientid,export_path,last_month)
+        channels(main_df,clientid,export_path,last_month)
+        peak_hour(main_df,clientid,export_path,last_month)
+        csat_metrics(main_df,clientid,export_path,last_month)
+        menu_metrics(main_df,clientid,export_path,last_month)
+        drops(main_df,clientid,export_path,last_month)
+        agent_metrics(main_df,clientid,export_path,last_month)
+        recipe(main_df,clientid,export_path,last_month)
+        bot_closure(main_df,clientid,export_path,last_month)
+        
+        logger.info("All metrics processed successfully")
+        
+    except Exception as e:
+        logger.error(f"Error processing metrics: {str(e)}")
+        raise
+    finally:
+        spark.stop()
+        logger.info("Spark session stopped")
+
+if __name__ == "__main__":
+    newsletter_entry()
+    
 
 
